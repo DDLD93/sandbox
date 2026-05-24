@@ -1,0 +1,18 @@
+{
+  "name": "fetch-download-service",
+  "version": "1.1.0",
+  "description": "Paste a URL in the browser to download a file, or POST a URL to the API and get the file streamed back. Plus an audio transcriber section (chunk + OpenRouter STT, jobs in Postgres, artifacts in MinIO).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --env-file=.env server.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@openrouter/sdk": "^0.1.0",
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^3.1.0",
+    "minio": "^8.0.1",
+    "pg": "^8.11.5"
+  }
+}
