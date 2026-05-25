@@ -25,6 +25,22 @@ function enqueue(jobId) {
   pump();
 }
 
+// Cooperative stop. A queued-but-not-started job is dropped from the queue so
+// it never starts. A job already running is halted by the DB-status check in
+// processJob (the route flips status to 'stopped' before calling this).
+function requestStop(jobId) {
+  const i = queue.indexOf(jobId);
+  if (i !== -1) queue.splice(i, 1);
+  queued.delete(jobId);
+}
+
+async function isStopped(jobId) {
+  const { rows } = await db.query(`SELECT status FROM transcribe_jobs WHERE id = $1`, [jobId]);
+  // A deleted job (row gone) counts as stopped so an in-flight job halts cleanly
+  // instead of erroring on objects the delete handler has already removed.
+  return !rows[0] || rows[0].status === "stopped";
+}
+
 async function pump() {
   if (running) return;
   running = true;
@@ -87,6 +103,10 @@ async function processJob(jobId) {
     );
 
     for (const seg of segments) {
+      if (await isStopped(jobId)) {
+        console.log(`[transcribe] job ${jobId} stopped during chunking`);
+        return;
+      }
       const key = `jobs/${jobId}/chunks/${String(seg.idx).padStart(3, "0")}.${fileExt}`;
       await storage.putFile(key, seg.path, `audio/${fileExt}`);
       await db.query(
@@ -107,13 +127,20 @@ async function processJob(jobId) {
   );
 
   for (const chunk of pending.rows) {
+    // Cooperative stop: the in-flight chunk (previous iteration) is already
+    // saved; halt before touching the next one. Leaves the job 'stopped'.
+    if (await isStopped(jobId)) {
+      console.log(`[transcribe] job ${jobId} stopped before chunk ${chunk.idx}`);
+      return;
+    }
     await db.query(`UPDATE transcribe_chunks SET status = 'processing' WHERE id = $1`, [chunk.id]);
     try {
       const buf = await storage.getBuffer(chunk.object_key);
       const text = await openrouter.transcribeChunk(
         job.model,
         buf.toString("base64"),
-        fileExt
+        fileExt,
+        { prompt: job.system_prompt }
       );
       await db.query(
         `UPDATE transcribe_chunks SET status = 'done', transcript = $2, error = NULL WHERE id = $1`,
@@ -186,4 +213,4 @@ async function recover() {
   if (rows.length) console.log(`[transcribe] recovering ${rows.length} job(s)`);
 }
 
-module.exports = { enqueue, recover };
+module.exports = { enqueue, requestStop, recover };

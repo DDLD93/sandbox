@@ -4,12 +4,18 @@
 // Zero dependencies — uses only Node built-ins (Node 18+ for global fetch).
 // Usage: node server.js   then open http://localhost:3000
 
+// Load .env into process.env first, before any module reads env vars (the
+// transcriber's db/storage modules build clients from env at load time). Missing
+// .env is fine — dotenv no-ops, and real env vars (e.g. from Docker) win since
+// dotenv never overrides values already present in process.env.
+require("dotenv").config();
+
 const http = require("http");
 const path = require("path");
 const { Readable } = require("stream");
 
 // Transcriber section (audio chunking + OpenRouter STT, jobs in Postgres,
-// artifacts in MinIO). Self-contained under ./transcribe.
+// artifacts in S3-compatible storage). Self-contained under ./transcribe.
 const transcribe = require("./transcribe/routes");
 
 const PORT = process.env.PORT || 8000;
@@ -217,40 +223,57 @@ const PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Fetch &amp; Download</title>
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: light;
+    --bg: #f8fafc;
+    --surface: #ffffff;
+    --surface-2: #f1f5f9;
+    --border: #e2e8f0;
+    --text: #0f172a;
+    --muted: #64748b;
+    --accent: #2563eb;
+    --accent-hover: #1d4ed8;
+    --danger: #dc2626;
+    --ok: #16a34a;
+    --radius: 12px;
+    --shadow: 0 1px 2px rgba(15,23,42,.04), 0 8px 24px rgba(15,23,42,.06);
+  }
   * { box-sizing: border-box; }
   body {
-    margin: 0; min-height: 100vh; display: grid; place-items: center;
-    font: 16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-    background: radial-gradient(circle at 30% 10%, #1e293b, #0f172a 60%);
-    color: #e2e8f0;
+    margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 1rem;
+    font: 15px/1.55 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased;
   }
   .card {
-    width: min(560px, 92vw); padding: 2.2rem;
-    background: rgba(30, 41, 59, .7); border: 1px solid #334155;
-    border-radius: 18px; box-shadow: 0 20px 60px rgba(0,0,0,.45);
-    backdrop-filter: blur(6px);
+    width: min(560px, 92vw); padding: 2rem;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow);
   }
-  h1 { margin: 0 0 .3rem; font-size: 1.5rem; }
-  p.sub { margin: 0 0 1.5rem; color: #94a3b8; font-size: .92rem; }
-  label { display: block; font-size: .8rem; color: #94a3b8; margin-bottom: .4rem; }
+  h1 { margin: 0 0 .25rem; font-size: 1.4rem; font-weight: 600; letter-spacing: -.01em; }
+  p.sub { margin: 0 0 1.4rem; color: var(--muted); font-size: .9rem; }
+  label { display: block; font-size: .72rem; font-weight: 600; letter-spacing: .03em;
+          text-transform: uppercase; color: var(--muted); margin-bottom: .4rem; }
   input {
-    width: 100%; padding: .8rem 1rem; font-size: 1rem;
-    background: #0f172a; color: #e2e8f0;
-    border: 1px solid #334155; border-radius: 10px; outline: none;
+    width: 100%; padding: .7rem .85rem; font-size: .95rem;
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); border-radius: 9px; outline: none;
+    transition: border-color .15s, box-shadow .15s;
   }
-  input:focus { border-color: #38bdf8; box-shadow: 0 0 0 3px rgba(56,189,248,.2); }
+  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
   button {
-    margin-top: 1rem; width: 100%; padding: .85rem; font-size: 1rem; font-weight: 600;
-    color: #04121f; background: linear-gradient(135deg, #38bdf8, #22d3ee);
-    border: 0; border-radius: 10px; cursor: pointer; transition: opacity .15s;
+    margin-top: 1.3rem; width: 100%; padding: .75rem; font-size: .95rem; font-weight: 600;
+    color: #fff; background: var(--accent);
+    border: 0; border-radius: 9px; cursor: pointer; transition: background .15s, opacity .15s;
+    box-shadow: var(--shadow);
   }
+  button:hover { background: var(--accent-hover); }
   button:disabled { opacity: .55; cursor: progress; }
-  .status { margin-top: 1rem; min-height: 1.4rem; font-size: .9rem; }
-  .status.err { color: #f87171; }
-  .status.ok { color: #4ade80; }
-  code { background: #0f172a; padding: .15rem .4rem; border-radius: 6px; font-size: .82rem; }
-  .api { margin-top: 1.6rem; padding-top: 1.2rem; border-top: 1px solid #334155; color: #64748b; font-size: .8rem; }
+  .status { margin-top: 1rem; min-height: 1.4rem; font-size: .88rem; }
+  .status.err { color: var(--danger); }
+  .status.ok { color: var(--ok); }
+  code { background: var(--surface-2); padding: .15rem .4rem; border-radius: 6px;
+         font-size: .82rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .api { margin-top: 1.6rem; padding-top: 1.2rem; border-top: 1px solid var(--border); color: var(--muted); font-size: .8rem; }
 </style>
 </head>
 <body>
@@ -265,7 +288,7 @@ const PAGE = `<!doctype html>
     <div id="status" class="status"></div>
     <div class="api">
       API: <code>POST /api/download</code> with JSON <code>{ "url": "..." }</code> returns the file.
-      <br /><br />Need speech-to-text? <a href="/transcribe" style="color:#38bdf8">Open the Audio Transcriber &rarr;</a>
+      <br /><br />Need speech-to-text? <a href="/transcribe" style="color:var(--accent)">Open the Audio Transcriber &rarr;</a>
     </div>
   </div>
 <script>

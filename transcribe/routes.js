@@ -50,6 +50,7 @@ async function startJob(req, res, url) {
   const unit = q.get("unit") === "mb" ? "mb" : "seconds";
   const size = Number(q.get("size"));
   const model = q.get("model");
+  const systemPrompt = q.get("prompt") || null;
 
   if (!model) return sendJson(res, 400, { error: "Missing 'model'" });
   if (!size || size <= 0) return sendJson(res, 400, { error: "Invalid 'size'" });
@@ -81,13 +82,29 @@ async function startJob(req, res, url) {
 
   await db.query(
     `INSERT INTO transcribe_jobs
-       (id, filename, content_type, file_size, chunk_unit, chunk_size, model, source_key, status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending')`,
-    [jobId, filename, contentType, bytes, unit, size, model, sourceKey]
+       (id, filename, content_type, file_size, chunk_unit, chunk_size, model, system_prompt, source_key, status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending')`,
+    [jobId, filename, contentType, bytes, unit, size, model, systemPrompt, sourceKey]
+  );
+
+  // Remember these as the last-used defaults so the form can pre-fill next time.
+  await db.query(
+    `INSERT INTO transcribe_settings (id, chunk_unit, chunk_size, model, system_prompt, updated_at)
+       VALUES ('last_used', $1, $2, $3, $4, now())
+     ON CONFLICT (id) DO UPDATE
+       SET chunk_unit = $1, chunk_size = $2, model = $3, system_prompt = $4, updated_at = now()`,
+    [unit, size, model, systemPrompt]
   );
 
   worker.enqueue(jobId);
   sendJson(res, 202, { jobId });
+}
+
+async function getSettings(res) {
+  const { rows } = await db.query(
+    `SELECT chunk_unit, chunk_size, model, system_prompt FROM transcribe_settings WHERE id = 'last_used'`
+  );
+  sendJson(res, 200, { settings: rows[0] || null });
 }
 
 async function listJobs(res) {
@@ -119,16 +136,44 @@ async function resumeJob(res, id) {
   sendJson(res, 202, { jobId: id, resumed: true });
 }
 
-async function streamResult(res, id) {
+async function stopJob(res, id) {
+  const job = await db.query(`SELECT status FROM transcribe_jobs WHERE id = $1`, [id]);
+  if (!job.rows[0]) return sendJson(res, 404, { error: "Job not found" });
+  // Flip to 'stopped' only if still active; the worker observes this between
+  // chunks (finishing the in-flight one) and a queued job is dropped below.
+  await db.query(
+    `UPDATE transcribe_jobs SET status = 'stopped', updated_at = now()
+       WHERE id = $1 AND status IN ('pending','chunking','processing')`,
+    [id]
+  );
+  worker.requestStop(id);
+  sendJson(res, 202, { jobId: id, stopped: true });
+}
+
+// Stop the job if active, remove every object under its bucket prefix, then delete
+// the job row (transcribe_chunks cascades). Works for ongoing and completed jobs.
+async function deleteJob(res, id) {
+  const job = await db.query(`SELECT id FROM transcribe_jobs WHERE id = $1`, [id]);
+  if (!job.rows[0]) return sendJson(res, 404, { error: "Job not found" });
+  worker.requestStop(id);
+  await storage.deletePrefix(`jobs/${id}/`);
+  await db.query(`DELETE FROM transcribe_jobs WHERE id = $1`, [id]);
+  sendJson(res, 200, { deleted: true });
+}
+
+async function streamResult(res, id, inline) {
   const job = await db.query(`SELECT result_key, filename FROM transcribe_jobs WHERE id = $1`, [id]);
   const row = job.rows[0];
   if (!row || !row.result_key)
     return sendJson(res, 404, { error: "Result not ready" });
-  const name = (row.filename || "transcription").replace(/\.[^.]+$/, "") + ".md";
-  res.writeHead(200, {
-    "content-type": "text/markdown; charset=utf-8",
-    "content-disposition": `attachment; filename="${name.replace(/"/g, "")}"`,
-  });
+  const headers = { "content-type": "text/markdown; charset=utf-8" };
+  // Inline mode (used by the in-page preview) omits the attachment disposition so
+  // the browser/fetch receives the raw markdown rather than triggering a download.
+  if (!inline) {
+    const name = (row.filename || "transcription").replace(/\.[^.]+$/, "") + ".md";
+    headers["content-disposition"] = `attachment; filename="${name.replace(/"/g, "")}"`;
+  }
+  res.writeHead(200, headers);
   const stream = await storage.getStream(row.result_key);
   stream.pipe(res);
 }
@@ -144,7 +189,11 @@ async function handle(req, res, url) {
       return true;
     }
     if (req.method === "GET" && p === "/api/transcribe/models") {
-      sendJson(res, 200, { models: await openrouter.listAudioModels() });
+      sendJson(res, 200, { models: await openrouter.listModels() });
+      return true;
+    }
+    if (req.method === "GET" && p === "/api/transcribe/settings") {
+      await getSettings(res);
       return true;
     }
     if (req.method === "POST" && p === "/api/transcribe") {
@@ -156,12 +205,15 @@ async function handle(req, res, url) {
       return true;
     }
 
-    const m = p.match(/^\/api\/transcribe\/jobs\/([0-9a-f-]+)(\/result|\/resume)?$/i);
+    const m = p.match(/^\/api\/transcribe\/jobs\/([0-9a-f-]+)(\/result|\/resume|\/stop)?$/i);
     if (m) {
       const id = m[1];
       if (req.method === "GET" && !m[2]) return (await jobDetail(res, id)), true;
-      if (req.method === "GET" && m[2] === "/result") return (await streamResult(res, id)), true;
+      if (req.method === "DELETE" && !m[2]) return (await deleteJob(res, id)), true;
+      if (req.method === "GET" && m[2] === "/result")
+        return (await streamResult(res, id, url.searchParams.get("inline") === "1")), true;
       if (req.method === "POST" && m[2] === "/resume") return (await resumeJob(res, id)), true;
+      if (req.method === "POST" && m[2] === "/stop") return (await stopJob(res, id)), true;
     }
 
     sendJson(res, 404, { error: "Not found" });
