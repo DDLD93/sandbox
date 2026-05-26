@@ -96,6 +96,7 @@ const PAGE = `<!doctype html>
            font-size: .7rem; font-weight: 600; }
   .b-completed { background: #dcfce7; color: #15803d; }
   .b-failed { background: #fee2e2; color: #b91c1c; }
+  .b-sync { background: #e0e7ff; color: #4338ca; }
   .b-stopped { background: #fef3c7; color: #b45309; }
   .b-processing, .b-chunking, .b-pending { background: #dbeafe; color: #1d4ed8; }
   .bar { height: 6px; background: var(--surface-2); border-radius: 999px; overflow: hidden; min-width: 80px; }
@@ -188,8 +189,8 @@ const PAGE = `<!doctype html>
       <button type="button" id="newJobBtn" class="btn">+ New transcription</button>
     </div>
     <table>
-      <thead><tr><th>File</th><th>Model</th><th>Status</th><th>Progress</th><th>Created</th><th>Time taken</th><th></th></tr></thead>
-      <tbody id="jobs"><tr><td colspan="7" style="color:var(--muted)">No jobs yet.</td></tr></tbody>
+      <thead><tr><th>File</th><th>Model</th><th>Status</th><th>Progress</th><th>Created</th><th>Time taken</th><th>Sync</th><th></th></tr></thead>
+      <tbody id="jobs"><tr><td colspan="8" style="color:var(--muted)">No jobs yet.</td></tr></tbody>
     </table>
   </div>
 
@@ -442,7 +443,7 @@ async function refresh() {
   try {
     const { jobs } = await (await fetch('/api/transcribe/jobs')).json();
     const tb = $('jobs');
-    if (!jobs.length) { tb.innerHTML = '<tr><td colspan="7" style="color:var(--muted)">No jobs yet.</td></tr>'; return; }
+    if (!jobs.length) { tb.innerHTML = '<tr><td colspan="8" style="color:var(--muted)">No jobs yet.</td></tr>'; return; }
     tb.innerHTML = jobs.map(j => {
       const pct = j.total_chunks ? Math.round(100 * j.completed_chunks / j.total_chunks) : 0;
       // Time-to-process: created→updated for finished jobs (updated_at is the
@@ -462,12 +463,18 @@ async function refresh() {
       }
       // Delete is available on every job; it stops the job (if active) and wipes its files.
       act += '<button class="act danger" onclick="deleteJob(\\'' + j.id + '\\')">Delete</button>';
+      // Sync = whether this transcript carries real word-level timestamps (word-synced
+      // playback highlight). Absent for chat-model jobs and jobs not yet transcribed.
+      const sync = j.has_words
+        ? '<span class="badge b-sync">✓ sync</span>'
+        : '<span style="color:var(--muted)">—</span>';
       return '<tr><td>' + j.filename + '</td><td style="color:var(--muted)">' + j.model + '</td><td>' + badge(j.status) +
         (j.error ? '<div style="color:var(--danger);font-size:.72rem;margin-top:.2rem">' + j.error + '</div>' : '') +
         '</td><td><div class="bar"><i style="width:' + pct + '%"></i></div>' +
         '<span style="font-size:.72rem;color:var(--muted)">' + j.completed_chunks + '/' + j.total_chunks + '</span></td>' +
         '<td style="color:var(--muted);font-size:.8rem;white-space:nowrap">' + fmtWhen(j.created_at) + '</td>' +
         '<td style="color:var(--muted);font-size:.8rem;white-space:nowrap">' + taken + '</td>' +
+        '<td>' + sync + '</td>' +
         '<td>' + act + '</td></tr>';
     }).join('');
   } catch {}
@@ -489,9 +496,9 @@ async function deleteJob(id) {
 
 /* ---------- preview: per-segment audio + synced highlight ---------- */
 // Loads the job's chunks (text + timing) and renders each as a segment with an
-// audio player. As a segment plays, the current word is highlighted: precisely
-// when the chunk carries real word-level timestamps (STT/verbose_json), and
-// otherwise from a char-weighted estimate spread across the segment's duration.
+// audio player. As a segment plays, the current word is highlighted — but only
+// when the chunk carries real word-level timestamps (STT/verbose_json). Chunks
+// without them (e.g. chat-model transcripts) play with no highlight.
 let previewChunks = []; // chunks of the open preview — used by the Copy action
 
 async function openPreview(id, encName) {
@@ -667,8 +674,8 @@ function renderSegments(jobId, chunks) {
 }
 
 // Wrap each visible word inside an element in a <span class="wd"> (skipping
-// code/pre), preserving the surrounding markup. data-w is the word's character
-// length — the weight used by the heuristic highlight when no real timing exists.
+// code/pre), preserving the surrounding markup. These spans are the highlight
+// targets for word-synced playback when real word timestamps are available.
 function wrapWords(container) {
   const SKIP = { CODE: 1, PRE: 1 };
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
@@ -691,7 +698,6 @@ function wrapWords(container) {
       } else {
         const span = document.createElement('span');
         span.className = 'wd';
-        span.dataset.w = String(part.length);
         span.textContent = part;
         frag.appendChild(span);
       }
@@ -704,22 +710,20 @@ function wireSegmentHighlighting() {
   const audios = [...$('previewBody').querySelectorAll('.seg-audio')];
   audios.forEach((audio) => {
     const seg = audio.closest('.seg');
-    const spans = [...seg.querySelectorAll('.wd')];
-    if (!spans.length) return;
 
-    // Prefer real per-word timestamps (relative to this chunk's audio) when their
-    // count matches the rendered words; otherwise fall back to a char-weighted
-    // estimate spread across the audio duration.
+    // Only one segment plays at a time; (re)apply the chosen speed on play. This is
+    // wired for every segment, synced or not.
+    audio.addEventListener('play', () => {
+      audio.playbackRate = Number($('speedSel').value) || 1;
+      audios.forEach((a) => { if (a !== audio) a.pause(); });
+    });
+
+    // Word-synced highlight requires real per-word timestamps (relative to this
+    // chunk's audio) whose count matches the rendered words. When they aren't
+    // present, the segment plays with no highlight at all — there is no estimate.
+    const spans = [...seg.querySelectorAll('.wd')];
     const words = seg._words;
-    const useReal = words && words.length === spans.length;
-    let bounds = null;
-    if (!useReal) {
-      const weights = spans.map((s) => Math.max(1, Number(s.dataset.w) || 1));
-      const total = weights.reduce((a, b) => a + b, 0);
-      bounds = [];
-      let acc = 0;
-      for (const w of weights) { acc += w; bounds.push(acc / total); }
-    }
+    if (!spans.length || !words || words.length !== spans.length) return;
 
     let last = -1;
     const setActive = (i) => {
@@ -733,30 +737,16 @@ function wireSegmentHighlighting() {
     const clear = () => setActive(-1);
 
     audio.addEventListener('timeupdate', () => {
-      const dur = isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
-      if (!dur) return;
       const t = audio.currentTime;
-      let i;
-      if (useReal) {
-        // Highlight the last word that has started (small lead so it tracks ahead).
-        const lead = 0.12;
-        i = 0;
-        for (let k = 0; k < words.length; k++) {
-          if ((Number(words[k].start) || 0) <= t + lead) i = k; else break;
-        }
-      } else {
-        const prog = Math.min(0.999, t / dur + 0.15 / dur);
-        i = bounds.findIndex((b) => prog < b);
-        if (i === -1) i = spans.length - 1;
+      // Highlight the last word that has started (small lead so it tracks ahead).
+      const lead = 0.12;
+      let i = 0;
+      for (let k = 0; k < words.length; k++) {
+        if ((Number(words[k].start) || 0) <= t + lead) i = k; else break;
       }
       setActive(i);
     });
     audio.addEventListener('ended', clear);
-    // Only one segment plays at a time; (re)apply the chosen speed on play.
-    audio.addEventListener('play', () => {
-      audio.playbackRate = Number($('speedSel').value) || 1;
-      audios.forEach((a) => { if (a !== audio) a.pause(); });
-    });
   });
 }
 

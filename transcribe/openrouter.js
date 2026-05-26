@@ -110,7 +110,7 @@ async function orFetch(path, body) {
 // Dedicated speech-to-text endpoint — only accepts STT models (e.g. whisper-1).
 // We ask for verbose_json with word-level timestamps so the preview UI can sync
 // the highlight to the audio precisely; a model that ignores this just returns
-// text and `words` comes back null (the UI then falls back to a heuristic).
+// text and `words` comes back null (the preview then shows no synced highlight).
 async function transcribeViaSTT(model, base64Data, format, opts) {
   const body = {
     model,
@@ -148,7 +148,8 @@ async function transcribeViaChat(model, base64Data, format, opts) {
     ],
   };
   const json = await orFetch("/chat/completions", body);
-  // Chat models transcribe verbatim text but give no word timing — heuristic only.
+  // Chat models transcribe verbatim text but give no word timing, so the preview
+  // shows no synced highlight for these.
   return { text: json.choices?.[0]?.message?.content ?? "", words: null };
 }
 
