@@ -109,7 +109,7 @@ async function getSettings(res) {
 
 async function listJobs(res) {
   const { rows } = await db.query(
-    `SELECT id, filename, status, total_chunks, completed_chunks, model, error, created_at
+    `SELECT id, filename, status, total_chunks, completed_chunks, model, error, created_at, updated_at
        FROM transcribe_jobs ORDER BY created_at DESC LIMIT 200`
   );
   sendJson(res, 200, { jobs: rows });

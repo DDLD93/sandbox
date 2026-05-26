@@ -188,8 +188,8 @@ const PAGE = `<!doctype html>
       <button type="button" id="newJobBtn" class="btn">+ New transcription</button>
     </div>
     <table>
-      <thead><tr><th>File</th><th>Model</th><th>Status</th><th>Progress</th><th></th></tr></thead>
-      <tbody id="jobs"><tr><td colspan="5" style="color:var(--muted)">No jobs yet.</td></tr></tbody>
+      <thead><tr><th>File</th><th>Model</th><th>Status</th><th>Progress</th><th>Created</th><th>Time taken</th><th></th></tr></thead>
+      <tbody id="jobs"><tr><td colspan="7" style="color:var(--muted)">No jobs yet.</td></tr></tbody>
     </table>
   </div>
 
@@ -276,6 +276,25 @@ function fmtDuration(sec) {
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
   const pad = (x) => String(x).padStart(2, '0');
   return h ? h + ':' + pad(m) + ':' + pad(s) : m + ':' + pad(s);
+}
+// Compact local date+time for the jobs table, e.g. "May 26, 14:32".
+function fmtWhen(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  return d.toLocaleString(undefined, {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+}
+// Human elapsed time between two timestamps, e.g. "45s", "3m 24s", "1h 2m".
+function fmtElapsed(fromIso, toIso) {
+  const a = new Date(fromIso).getTime(), b = new Date(toIso).getTime();
+  if (!isFinite(a) || !isFinite(b) || b < a) return '';
+  let s = Math.round((b - a) / 1000);
+  if (s < 60) return s + 's';
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60); s = s % 60;
+  if (h) return h + 'h ' + m + 'm';
+  return m + 'm ' + s + 's';
 }
 
 /* ---------- modal plumbing ---------- */
@@ -423,9 +442,15 @@ async function refresh() {
   try {
     const { jobs } = await (await fetch('/api/transcribe/jobs')).json();
     const tb = $('jobs');
-    if (!jobs.length) { tb.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">No jobs yet.</td></tr>'; return; }
+    if (!jobs.length) { tb.innerHTML = '<tr><td colspan="7" style="color:var(--muted)">No jobs yet.</td></tr>'; return; }
     tb.innerHTML = jobs.map(j => {
       const pct = j.total_chunks ? Math.round(100 * j.completed_chunks / j.total_chunks) : 0;
+      // Time-to-process: created→updated for finished jobs (updated_at is the
+      // completion time); for active jobs, the live elapsed so far.
+      const terminal = ['completed','failed','stopped'].indexOf(j.status) !== -1;
+      const taken = terminal
+        ? (fmtElapsed(j.created_at, j.updated_at) || '—')
+        : (fmtElapsed(j.created_at, new Date().toISOString()) + ' …');
       let act = '';
       if (j.status === 'completed') {
         act = '<button class="act" onclick="openPreview(\\'' + j.id + '\\', \\'' + encodeURIComponent(j.filename || '') + '\\')">Preview</button>' +
@@ -441,6 +466,8 @@ async function refresh() {
         (j.error ? '<div style="color:var(--danger);font-size:.72rem;margin-top:.2rem">' + j.error + '</div>' : '') +
         '</td><td><div class="bar"><i style="width:' + pct + '%"></i></div>' +
         '<span style="font-size:.72rem;color:var(--muted)">' + j.completed_chunks + '/' + j.total_chunks + '</span></td>' +
+        '<td style="color:var(--muted);font-size:.8rem;white-space:nowrap">' + fmtWhen(j.created_at) + '</td>' +
+        '<td style="color:var(--muted);font-size:.8rem;white-space:nowrap">' + taken + '</td>' +
         '<td>' + act + '</td></tr>';
     }).join('');
   } catch {}
