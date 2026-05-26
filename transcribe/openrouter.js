@@ -108,12 +108,22 @@ async function orFetch(path, body) {
 }
 
 // Dedicated speech-to-text endpoint — only accepts STT models (e.g. whisper-1).
+// We ask for verbose_json with word-level timestamps so the preview UI can sync
+// the highlight to the audio precisely; a model that ignores this just returns
+// text and `words` comes back null (the UI then falls back to a heuristic).
 async function transcribeViaSTT(model, base64Data, format, opts) {
-  const body = { model, input_audio: { data: base64Data, format } };
+  const body = {
+    model,
+    input_audio: { data: base64Data, format },
+    response_format: "verbose_json",
+    timestamp_granularities: ["word", "segment"],
+  };
   if (opts.language) body.language = opts.language;
   if (opts.prompt) body.prompt = opts.prompt;
   const json = await orFetch("/audio/transcriptions", body);
-  return json.text ?? json.transcript ?? json.choices?.[0]?.message?.content ?? "";
+  const text = json.text ?? json.transcript ?? json.choices?.[0]?.message?.content ?? "";
+  const words = Array.isArray(json.words) ? json.words : null;
+  return { text, words };
 }
 
 // Chat-completions path — for audio-capable chat models (Gemini, gpt-4o-audio,
@@ -138,7 +148,8 @@ async function transcribeViaChat(model, base64Data, format, opts) {
     ],
   };
   const json = await orFetch("/chat/completions", body);
-  return json.choices?.[0]?.message?.content ?? "";
+  // Chat models transcribe verbatim text but give no word timing — heuristic only.
+  return { text: json.choices?.[0]?.message?.content ?? "", words: null };
 }
 
 // A 400/404 that means "this model isn't valid for this endpoint" — the signal
@@ -164,7 +175,9 @@ const guessRoute = (model) => (/whisper/i.test(model) ? "stt" : "chat");
 // (mp3, wav, m4a, ...). `opts.prompt` is an optional system/guidance prompt and
 // `opts.language` an optional language hint. Routes to the STT endpoint for
 // whisper-style models and to chat-completions for audio chat models, falling
-// back to the other route if the model isn't valid on the first. Returns text.
+// back to the other route if the model isn't valid on the first. Returns
+// { text, words } — words is an array of { word, start, end } from the STT path
+// (times relative to this chunk's audio) or null when unavailable.
 async function transcribeChunk(model, base64Data, format, opts = {}) {
   const order = routeCache.has(model)
     ? [routeCache.get(model)]
@@ -175,12 +188,12 @@ async function transcribeChunk(model, base64Data, format, opts = {}) {
   let lastErr;
   for (const route of order) {
     try {
-      const text =
+      const result =
         route === "stt"
           ? await transcribeViaSTT(model, base64Data, format, opts)
           : await transcribeViaChat(model, base64Data, format, opts);
       routeCache.set(model, route);
-      return text;
+      return result;
     } catch (err) {
       lastErr = err;
       if (!isWrongEndpoint(err)) throw err; // genuine failure — don't try the other route

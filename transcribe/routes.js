@@ -119,7 +119,7 @@ async function jobDetail(res, id) {
   const job = await db.query(`SELECT * FROM transcribe_jobs WHERE id = $1`, [id]);
   if (!job.rows[0]) return sendJson(res, 404, { error: "Job not found" });
   const chunks = await db.query(
-    `SELECT idx, status, start_sec, dur_sec, transcript, error FROM transcribe_chunks WHERE job_id = $1 ORDER BY idx`,
+    `SELECT idx, status, start_sec, dur_sec, transcript, words, error FROM transcribe_chunks WHERE job_id = $1 ORDER BY idx`,
     [id]
   );
   sendJson(res, 200, { job: job.rows[0], chunks: chunks.rows });

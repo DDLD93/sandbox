@@ -1,6 +1,6 @@
 // Inline HTML for the transcriber page. Light, professional theme shared with the
 // fetch/download page. Jobs are created in a modal; completed results can be
-// previewed segment-by-segment (audio playback + synced phrase highlight) or downloaded.
+// previewed segment-by-segment (audio playback + synced word highlight) or downloaded.
 
 const PAGE = `<!doctype html>
 <html lang="en">
@@ -155,8 +155,25 @@ const PAGE = `<!doctype html>
   .seg-text { line-height: 1.85; }
   .seg-text > :first-child { margin-top: 0; }
   .seg-text > :last-child { margin-bottom: 0; }
-  .ph { padding: .05rem .15rem; border-radius: 4px; transition: background .12s; cursor: default; }
-  .ph.active { background: #fde68a; color: #0f172a; }
+  .wd { border-radius: 4px; transition: background .1s, color .1s; }
+  .wd.active { background: #fde68a; color: #0f172a; box-shadow: 0 0 0 2px #fde68a; }
+
+  /* Preview quick-action toolbar */
+  .preview-toolbar {
+    display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+    margin: .2rem 0 1rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border);
+  }
+  .preview-toolbar .act { margin: 0; }
+  .preview-toolbar .spacer { flex: 1; }
+  .preview-toolbar label.inline {
+    display: inline-flex; align-items: center; gap: .35rem; margin: 0;
+    font-size: .76rem; font-weight: 500; text-transform: none; letter-spacing: 0;
+    color: var(--text); cursor: pointer;
+  }
+  .preview-toolbar label.inline input { width: auto; }
+  .preview-toolbar select.speed {
+    width: auto; padding: .3rem 1.6rem .3rem .6rem; font-size: .76rem; border-radius: 7px;
+  }
 </style>
 </head>
 <body>
@@ -222,6 +239,20 @@ const PAGE = `<!doctype html>
       <div class="modal-head">
         <h2 id="previewTitle">Preview</h2>
         <button type="button" class="modal-close" data-close="previewModal">&times;</button>
+      </div>
+      <div class="preview-toolbar" id="previewToolbar" style="display:none">
+        <button type="button" class="act" id="copyBtn">Copy transcript</button>
+        <a class="act" id="downloadBtn" href="#">Download .md</a>
+        <span class="spacer"></span>
+        <label class="inline"><input type="checkbox" id="autoScroll" checked /> Auto-scroll</label>
+        <label class="inline">Speed
+          <select class="speed" id="speedSel">
+            <option value="1">1×</option>
+            <option value="1.25">1.25×</option>
+            <option value="1.5">1.5×</option>
+            <option value="2">2×</option>
+          </select>
+        </label>
       </div>
       <div class="markdown-body" id="previewBody"></div>
     </div>
@@ -431,23 +462,58 @@ async function deleteJob(id) {
 
 /* ---------- preview: per-segment audio + synced highlight ---------- */
 // Loads the job's chunks (text + timing) and renders each as a segment with an
-// audio player. As a segment plays, the current phrase is highlighted — timing is
-// approximate (phrases are spread across the segment's duration, weighted by word
-// count) since the transcription pipeline stores no real word-level timestamps.
+// audio player. As a segment plays, the current word is highlighted: precisely
+// when the chunk carries real word-level timestamps (STT/verbose_json), and
+// otherwise from a char-weighted estimate spread across the segment's duration.
+let previewChunks = []; // chunks of the open preview — used by the Copy action
+
 async function openPreview(id, encName) {
   const name = decodeURIComponent(encName || '');
   $('previewTitle').textContent = name ? 'Preview — ' + name : 'Preview';
   $('previewBody').innerHTML = '<p style="color:var(--muted)">Loading…</p>';
+  $('previewToolbar').style.display = 'none';
+  previewChunks = [];
   openModal('previewModal');
   try {
     const res = await fetch('/api/transcribe/jobs/' + id);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const { chunks } = await res.json();
-    renderSegments(id, chunks || []);
+    previewChunks = chunks || [];
+    $('downloadBtn').href = '/api/transcribe/jobs/' + id + '/result';
+    renderSegments(id, previewChunks);
+    $('previewToolbar').style.display = 'flex';
   } catch (err) {
     $('previewBody').innerHTML = '<p style="color:var(--danger)">Could not load result: ' + err.message + '</p>';
   }
 }
+
+// Apply the chosen playback speed to every segment player currently rendered.
+function applyPlaybackSpeed() {
+  const rate = Number($('speedSel').value) || 1;
+  $('previewBody').querySelectorAll('.seg-audio').forEach((a) => { a.playbackRate = rate; });
+}
+
+// Toolbar wiring (elements are static, so wire once at load).
+$('copyBtn').addEventListener('click', async () => {
+  const text = previewChunks.map((c) => (c.transcript || '').trim()).filter(Boolean).join('\\n\\n');
+  const btn = $('copyBtn'), orig = btn.textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.textContent = 'Copied ✓';
+  } catch {
+    btn.textContent = 'Copy failed';
+  }
+  setTimeout(() => { btn.textContent = orig; }, 1500);
+});
+$('speedSel').addEventListener('change', () => {
+  localStorage.setItem('tr_speed', $('speedSel').value);
+  applyPlaybackSpeed();
+});
+// Restore the remembered playback speed.
+(() => {
+  const saved = localStorage.getItem('tr_speed');
+  if (saved && [...$('speedSel').options].some((o) => o.value === saved)) $('speedSel').value = saved;
+})();
 
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -461,14 +527,6 @@ function fmtClock(sec) {
   return h ? h + ':' + pad(m) + ':' + pad(s) : m + ':' + pad(s);
 }
 
-// Split into phrases on sentence-ending punctuation, keeping the punctuation.
-function splitPhrases(text) {
-  const t = (text || '').trim();
-  if (!t) return [];
-  const parts = t.match(/[^.!?…]+[.!?…]+["')\\]]*|\\S[^.!?…]*$/g);
-  return parts ? parts.map((s) => s.trim()).filter(Boolean) : [t];
-}
-
 // Escape, then apply bold/italic. Code spans and links are protected upstream,
 // so this only sees plain text plus emphasis markers.
 function inlineFmt(s) {
@@ -477,11 +535,12 @@ function inlineFmt(s) {
     .replace(/\\*([^*\\n]+)\\*/g, '<em>$1</em>');
 }
 
-// Split a text run into sentence phrases and wrap each in a .ph span (with a
-// word-count weight) so audio sync can highlight it. Code spans and links are
-// pulled out behind placeholders first so sentence-splitting can't break them
-// (e.g. the dot in a URL is not a sentence boundary).
-function inlinePhrases(text) {
+// Apply inline markdown (bold/italic) to a text run. Code spans and links are
+// pulled out behind placeholders first so emphasis markers inside them aren't
+// re-processed, then restored. No highlight spans here — word wrapping for the
+// playback highlight happens in a separate DOM pass (wrapWords) so it never
+// breaks the rendered markup.
+function inlineMd(text) {
   const store = [];
   const hide = (html) => { store.push(html); return '\\u0001' + (store.length - 1) + '\\u0001'; };
   const t = (text || '')
@@ -489,16 +548,12 @@ function inlinePhrases(text) {
     .replace(/\\[([^\\]]+)\\]\\(([^)\\s]+)\\)/g,
       (_, label, url) => hide('<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener">' + inlineFmt(label) + '</a>'));
   const restore = (s) => s.replace(/\\u0001(\\d+)\\u0001/g, (_, n) => store[n]);
-  const phrases = splitPhrases(t);
-  const runs = phrases.length ? phrases : [t];
-  return runs
-    .map((p) => '<span class="ph" data-w="' + p.split(/\\s+/).length + '">' + restore(inlineFmt(p)) + '</span>')
-    .join(' ');
+  return restore(inlineFmt(t));
 }
 
 // Render a chunk transcript (Markdown) to HTML — headings, lists, blockquotes,
-// fenced code, and paragraphs with soft line breaks — keeping text phrase-wrapped
-// so the per-segment highlight still works.
+// fenced code, and paragraphs with soft line breaks. Inline text is formatted
+// here; the per-word highlight spans are added afterwards by wrapWords.
 function renderTranscript(text) {
   const lines = (text || '').replace(/\\r\\n?/g, '\\n').split('\\n');
   const isBlank = (l) => /^\\s*$/.test(l);
@@ -521,14 +576,14 @@ function renderTranscript(text) {
     const h = line.match(/^\\s*(#{1,6})\\s+(.*)$/);
     if (h) {
       const lvl = Math.min(6, h[1].length);
-      html += '<h' + lvl + '>' + inlinePhrases(h[2].trim()) + '</h' + lvl + '>';
+      html += '<h' + lvl + '>' + inlineMd(h[2].trim()) + '</h' + lvl + '>';
       i++;
       continue;
     }
     if (isQuote(line)) {
       const buf = [];
       while (i < lines.length && isQuote(lines[i])) { buf.push(lines[i].replace(/^\\s*>\\s?/, '')); i++; }
-      html += '<blockquote>' + inlinePhrases(buf.join(' ')) + '</blockquote>';
+      html += '<blockquote>' + inlineMd(buf.join(' ')) + '</blockquote>';
       continue;
     }
     if (isItem(line)) {
@@ -539,7 +594,7 @@ function renderTranscript(text) {
         i++;
       }
       const tag = ordered ? 'ol' : 'ul';
-      html += '<' + tag + '>' + items.map((it) => '<li>' + inlinePhrases(it.trim()) + '</li>').join('') + '</' + tag + '>';
+      html += '<' + tag + '>' + items.map((it) => '<li>' + inlineMd(it.trim()) + '</li>').join('') + '</' + tag + '>';
       continue;
     }
     const buf = [];
@@ -547,7 +602,7 @@ function renderTranscript(text) {
            !isQuote(lines[i]) && !isFence(lines[i]) && !isItem(lines[i])) {
       buf.push(lines[i].trim()); i++;
     }
-    html += '<p>' + buf.map((l) => inlinePhrases(l)).join('<br>') + '</p>';
+    html += '<p>' + buf.map((l) => inlineMd(l)).join('<br>') + '</p>';
   }
   return html;
 }
@@ -572,34 +627,109 @@ function renderSegments(jobId, chunks) {
         '<div class="seg-text">' + body + '</div>' +
       '</div>';
   }).join('');
+  // Wrap words for highlighting (a DOM pass, so markup is never broken) and stash
+  // each chunk's real word timestamps on its segment element for the sync logic.
+  [...$('previewBody').querySelectorAll('.seg')].forEach((segEl, i) => {
+    const textEl = segEl.querySelector('.seg-text');
+    if (textEl) wrapWords(textEl);
+    const w = chunks[i] && chunks[i].words;
+    segEl._words = Array.isArray(w) && w.length ? w : null;
+  });
   wireSegmentHighlighting();
+  applyPlaybackSpeed();
+}
+
+// Wrap each visible word inside an element in a <span class="wd"> (skipping
+// code/pre), preserving the surrounding markup. data-w is the word's character
+// length — the weight used by the heuristic highlight when no real timing exists.
+function wrapWords(container) {
+  const SKIP = { CODE: 1, PRE: 1 };
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!/\\S/.test(node.nodeValue || '')) return NodeFilter.FILTER_REJECT;
+      for (let p = node.parentNode; p && p !== container; p = p.parentNode) {
+        if (SKIP[p.nodeName]) return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  for (const node of nodes) {
+    const frag = document.createDocumentFragment();
+    for (const part of node.nodeValue.split(/(\\s+)/)) {
+      if (!part) continue;
+      if (/^\\s+$/.test(part)) {
+        frag.appendChild(document.createTextNode(part));
+      } else {
+        const span = document.createElement('span');
+        span.className = 'wd';
+        span.dataset.w = String(part.length);
+        span.textContent = part;
+        frag.appendChild(span);
+      }
+    }
+    node.parentNode.replaceChild(frag, node);
+  }
 }
 
 function wireSegmentHighlighting() {
   const audios = [...$('previewBody').querySelectorAll('.seg-audio')];
   audios.forEach((audio) => {
     const seg = audio.closest('.seg');
-    const spans = [...seg.querySelectorAll('.ph')];
+    const spans = [...seg.querySelectorAll('.wd')];
     if (!spans.length) return;
-    // Cumulative end-fraction per phrase, weighted by word count.
-    const weights = spans.map((s) => Math.max(1, Number(s.dataset.w) || 1));
-    const total = weights.reduce((a, b) => a + b, 0);
-    const bounds = [];
-    let acc = 0;
-    for (const w of weights) { acc += w; bounds.push(acc / total); }
 
-    const clear = () => spans.forEach((s) => s.classList.remove('active'));
+    // Prefer real per-word timestamps (relative to this chunk's audio) when their
+    // count matches the rendered words; otherwise fall back to a char-weighted
+    // estimate spread across the audio duration.
+    const words = seg._words;
+    const useReal = words && words.length === spans.length;
+    let bounds = null;
+    if (!useReal) {
+      const weights = spans.map((s) => Math.max(1, Number(s.dataset.w) || 1));
+      const total = weights.reduce((a, b) => a + b, 0);
+      bounds = [];
+      let acc = 0;
+      for (const w of weights) { acc += w; bounds.push(acc / total); }
+    }
+
+    let last = -1;
+    const setActive = (i) => {
+      if (i === last) return;
+      if (last >= 0 && spans[last]) spans[last].classList.remove('active');
+      last = i;
+      if (i < 0 || !spans[i]) return;
+      spans[i].classList.add('active');
+      if ($('autoScroll').checked) spans[i].scrollIntoView({ block: 'center', behavior: 'smooth' });
+    };
+    const clear = () => setActive(-1);
+
     audio.addEventListener('timeupdate', () => {
       const dur = isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
       if (!dur) return;
-      const prog = Math.min(0.999, audio.currentTime / dur);
-      let i = bounds.findIndex((b) => prog < b);
-      if (i === -1) i = spans.length - 1;
-      spans.forEach((s, j) => s.classList.toggle('active', j === i));
+      const t = audio.currentTime;
+      let i;
+      if (useReal) {
+        // Highlight the last word that has started (small lead so it tracks ahead).
+        const lead = 0.12;
+        i = 0;
+        for (let k = 0; k < words.length; k++) {
+          if ((Number(words[k].start) || 0) <= t + lead) i = k; else break;
+        }
+      } else {
+        const prog = Math.min(0.999, t / dur + 0.15 / dur);
+        i = bounds.findIndex((b) => prog < b);
+        if (i === -1) i = spans.length - 1;
+      }
+      setActive(i);
     });
     audio.addEventListener('ended', clear);
-    // Only one segment plays at a time.
-    audio.addEventListener('play', () => audios.forEach((a) => { if (a !== audio) a.pause(); }));
+    // Only one segment plays at a time; (re)apply the chosen speed on play.
+    audio.addEventListener('play', () => {
+      audio.playbackRate = Number($('speedSel').value) || 1;
+      audios.forEach((a) => { if (a !== audio) a.pause(); });
+    });
   });
 }
 

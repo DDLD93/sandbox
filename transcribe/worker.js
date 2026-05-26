@@ -136,15 +136,15 @@ async function processJob(jobId) {
     await db.query(`UPDATE transcribe_chunks SET status = 'processing' WHERE id = $1`, [chunk.id]);
     try {
       const buf = await storage.getBuffer(chunk.object_key);
-      const text = await openrouter.transcribeChunk(
+      const { text, words } = await openrouter.transcribeChunk(
         job.model,
         buf.toString("base64"),
         fileExt,
         { prompt: job.system_prompt }
       );
       await db.query(
-        `UPDATE transcribe_chunks SET status = 'done', transcript = $2, error = NULL WHERE id = $1`,
-        [chunk.id, text]
+        `UPDATE transcribe_chunks SET status = 'done', transcript = $2, words = $3::jsonb, error = NULL WHERE id = $1`,
+        [chunk.id, text, words ? JSON.stringify(words) : null]
       );
       await db.query(
         `UPDATE transcribe_jobs SET completed_chunks =
