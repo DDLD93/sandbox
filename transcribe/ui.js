@@ -152,7 +152,9 @@ const PAGE = `<!doctype html>
               gap: .8rem; margin-bottom: .5rem; flex-wrap: wrap; }
   .seg-title { font-weight: 600; font-size: .9rem; }
   .seg-audio { height: 34px; max-width: 320px; }
-  .seg-text { margin: 0; line-height: 1.85; }
+  .seg-text { line-height: 1.85; }
+  .seg-text > :first-child { margin-top: 0; }
+  .seg-text > :last-child { margin-bottom: 0; }
   .ph { padding: .05rem .15rem; border-radius: 4px; transition: background .12s; cursor: default; }
   .ph.active { background: #fde68a; color: #0f172a; }
 </style>
@@ -467,6 +469,89 @@ function splitPhrases(text) {
   return parts ? parts.map((s) => s.trim()).filter(Boolean) : [t];
 }
 
+// Escape, then apply bold/italic. Code spans and links are protected upstream,
+// so this only sees plain text plus emphasis markers.
+function inlineFmt(s) {
+  return escapeHtml(s)
+    .replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>')
+    .replace(/\\*([^*\\n]+)\\*/g, '<em>$1</em>');
+}
+
+// Split a text run into sentence phrases and wrap each in a .ph span (with a
+// word-count weight) so audio sync can highlight it. Code spans and links are
+// pulled out behind placeholders first so sentence-splitting can't break them
+// (e.g. the dot in a URL is not a sentence boundary).
+function inlinePhrases(text) {
+  const store = [];
+  const hide = (html) => { store.push(html); return '\\u0001' + (store.length - 1) + '\\u0001'; };
+  const t = (text || '')
+    .replace(/\`([^\`]+)\`/g, (_, c) => hide('<code>' + escapeHtml(c) + '</code>'))
+    .replace(/\\[([^\\]]+)\\]\\(([^)\\s]+)\\)/g,
+      (_, label, url) => hide('<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener">' + inlineFmt(label) + '</a>'));
+  const restore = (s) => s.replace(/\\u0001(\\d+)\\u0001/g, (_, n) => store[n]);
+  const phrases = splitPhrases(t);
+  const runs = phrases.length ? phrases : [t];
+  return runs
+    .map((p) => '<span class="ph" data-w="' + p.split(/\\s+/).length + '">' + restore(inlineFmt(p)) + '</span>')
+    .join(' ');
+}
+
+// Render a chunk transcript (Markdown) to HTML — headings, lists, blockquotes,
+// fenced code, and paragraphs with soft line breaks — keeping text phrase-wrapped
+// so the per-segment highlight still works.
+function renderTranscript(text) {
+  const lines = (text || '').replace(/\\r\\n?/g, '\\n').split('\\n');
+  const isBlank = (l) => /^\\s*$/.test(l);
+  const isHead = (l) => /^\\s*#{1,6}\\s+/.test(l);
+  const isQuote = (l) => /^\\s*>/.test(l);
+  const isFence = (l) => /^\\s*\`\`\`/.test(l);
+  const isItem = (l) => /^\\s*([-*+]|\\d+[.)])\\s+/.test(l);
+  let html = '', i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (isBlank(line)) { i++; continue; }
+    if (isFence(line)) {
+      i++;
+      const buf = [];
+      while (i < lines.length && !isFence(lines[i])) { buf.push(lines[i]); i++; }
+      i++; // closing fence
+      html += '<pre><code>' + escapeHtml(buf.join('\\n')) + '</code></pre>';
+      continue;
+    }
+    const h = line.match(/^\\s*(#{1,6})\\s+(.*)$/);
+    if (h) {
+      const lvl = Math.min(6, h[1].length);
+      html += '<h' + lvl + '>' + inlinePhrases(h[2].trim()) + '</h' + lvl + '>';
+      i++;
+      continue;
+    }
+    if (isQuote(line)) {
+      const buf = [];
+      while (i < lines.length && isQuote(lines[i])) { buf.push(lines[i].replace(/^\\s*>\\s?/, '')); i++; }
+      html += '<blockquote>' + inlinePhrases(buf.join(' ')) + '</blockquote>';
+      continue;
+    }
+    if (isItem(line)) {
+      const ordered = /^\\s*\\d+[.)]\\s+/.test(line);
+      const items = [];
+      while (i < lines.length && isItem(lines[i])) {
+        items.push(lines[i].replace(/^\\s*([-*+]|\\d+[.)])\\s+/, ''));
+        i++;
+      }
+      const tag = ordered ? 'ol' : 'ul';
+      html += '<' + tag + '>' + items.map((it) => '<li>' + inlinePhrases(it.trim()) + '</li>').join('') + '</' + tag + '>';
+      continue;
+    }
+    const buf = [];
+    while (i < lines.length && !isBlank(lines[i]) && !isHead(lines[i]) &&
+           !isQuote(lines[i]) && !isFence(lines[i]) && !isItem(lines[i])) {
+      buf.push(lines[i].trim()); i++;
+    }
+    html += '<p>' + buf.map((l) => inlinePhrases(l)).join('<br>') + '</p>';
+  }
+  return html;
+}
+
 function renderSegments(jobId, chunks) {
   if (!chunks.length) {
     $('previewBody').innerHTML = '<p style="color:var(--muted)">No segments.</p>';
@@ -475,17 +560,16 @@ function renderSegments(jobId, chunks) {
   $('previewBody').innerHTML = chunks.map((c) => {
     const start = Number(c.start_sec) || 0;
     const end = start + (Number(c.dur_sec) || 0);
-    const phrases = splitPhrases(c.transcript);
-    const spans = phrases.length
-      ? phrases.map((p) => '<span class="ph" data-w="' + p.split(/\\s+/).length + '">' + escapeHtml(p) + '</span>').join(' ')
-      : '<span style="color:var(--muted)">(no speech detected)</span>';
+    const body = (c.transcript && c.transcript.trim())
+      ? renderTranscript(c.transcript)
+      : '<p><span style="color:var(--muted)">(no speech detected)</span></p>';
     return '<div class="seg">' +
         '<div class="seg-head">' +
           '<span class="seg-title">Segment ' + (c.idx + 1) +
             ' <span style="color:var(--muted);font-weight:400">(' + fmtClock(start) + '–' + fmtClock(end) + ')</span></span>' +
           '<audio class="seg-audio" controls preload="none" src="/api/transcribe/jobs/' + jobId + '/chunks/' + c.idx + '/audio"></audio>' +
         '</div>' +
-        '<p class="seg-text">' + spans + '</p>' +
+        '<div class="seg-text">' + body + '</div>' +
       '</div>';
   }).join('');
   wireSegmentHighlighting();
