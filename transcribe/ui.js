@@ -1,6 +1,6 @@
 // Inline HTML for the transcriber page. Light, professional theme shared with the
-// fetch/download page. Advanced controls live in a settings modal; results can be
-// previewed (rendered Markdown) in a modal or downloaded.
+// fetch/download page. Jobs are created in a modal; completed results can be
+// previewed segment-by-segment (audio playback + synced phrase highlight) or downloaded.
 
 const PAGE = `<!doctype html>
 <html lang="en">
@@ -144,6 +144,17 @@ const PAGE = `<!doctype html>
   .markdown-body blockquote { margin: .6rem 0; padding: .2rem 0 .2rem .9rem;
     border-left: 3px solid var(--border); color: var(--muted); }
   .markdown-body a { color: var(--accent); }
+
+  /* Preview segments (audio + synced highlight) */
+  .seg { margin: 0 0 1.3rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); }
+  .seg:last-child { border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }
+  .seg-head { display: flex; align-items: center; justify-content: space-between;
+              gap: .8rem; margin-bottom: .5rem; flex-wrap: wrap; }
+  .seg-title { font-weight: 600; font-size: .9rem; }
+  .seg-audio { height: 34px; max-width: 320px; }
+  .seg-text { margin: 0; line-height: 1.85; }
+  .ph { padding: .05rem .15rem; border-radius: 4px; transition: background .12s; cursor: default; }
+  .ph.active { background: #fde68a; color: #0f172a; }
 </style>
 </head>
 <body>
@@ -236,7 +247,10 @@ function fmtDuration(sec) {
 
 /* ---------- modal plumbing ---------- */
 function openModal(id) { $(id).classList.add('open'); }
-function closeModal(id) { $(id).classList.remove('open'); }
+function closeModal(id) {
+  $(id).classList.remove('open');
+  $(id).querySelectorAll('audio').forEach((a) => a.pause()); // stop segment playback on close
+}
 document.querySelectorAll('[data-close]').forEach((el) =>
   el.addEventListener('click', () => closeModal(el.getAttribute('data-close'))));
 document.querySelectorAll('.modal-backdrop').forEach((bd) =>
@@ -413,86 +427,96 @@ async function deleteJob(id) {
   refresh();
 }
 
-/* ---------- markdown preview ---------- */
+/* ---------- preview: per-segment audio + synced highlight ---------- */
+// Loads the job's chunks (text + timing) and renders each as a segment with an
+// audio player. As a segment plays, the current phrase is highlighted — timing is
+// approximate (phrases are spread across the segment's duration, weighted by word
+// count) since the transcription pipeline stores no real word-level timestamps.
 async function openPreview(id, encName) {
   const name = decodeURIComponent(encName || '');
   $('previewTitle').textContent = name ? 'Preview — ' + name : 'Preview';
   $('previewBody').innerHTML = '<p style="color:var(--muted)">Loading…</p>';
   openModal('previewModal');
   try {
-    const res = await fetch('/api/transcribe/jobs/' + id + '/result?inline=1');
+    const res = await fetch('/api/transcribe/jobs/' + id);
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    const text = await res.text();
-    $('previewBody').innerHTML = renderMarkdown(text);
+    const { chunks } = await res.json();
+    renderSegments(id, chunks || []);
   } catch (err) {
     $('previewBody').innerHTML = '<p style="color:var(--danger)">Could not load result: ' + err.message + '</p>';
   }
 }
 
-// Minimal, XSS-safe Markdown renderer. Escapes HTML first, then applies block and
-// inline rules sufficient for transcription output (headings, lists, code, quotes…).
-function renderMarkdown(src) {
-  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  // Links resolved via a callback (avoids fragile $-ref handling), then emphasis/code.
-  const linkify = (s) => s.replace(/\\[([^\\]]+)\\]\\((https?:[^)\\s]+)\\)/g,
-    (_, txt, href) => '<a href="' + href + '" target="_blank" rel="noopener">' + txt + '</a>');
-  const inline = (s) => esc(s)
-    .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
-    .replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>')
-    .replace(/(^|[^*])\\*([^*\\n]+)\\*/g, '$1<em>$2</em>');
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
-  const lines = src.replace(/\\r\\n?/g, '\\n').split('\\n');
-  let out = '';
-  let i = 0;
-  let listType = null; // 'ul' | 'ol'
-  const closeList = () => { if (listType) { out += '</' + listType + '>'; listType = null; } };
+// mm:ss (or h:mm:ss) clock that renders 0 as "0:00" (unlike fmtDuration).
+function fmtClock(sec) {
+  sec = Math.max(0, Math.round(Number(sec) || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const pad = (x) => String(x).padStart(2, '0');
+  return h ? h + ':' + pad(m) + ':' + pad(s) : m + ':' + pad(s);
+}
 
-  while (i < lines.length) {
-    let line = lines[i];
+// Split into phrases on sentence-ending punctuation, keeping the punctuation.
+function splitPhrases(text) {
+  const t = (text || '').trim();
+  if (!t) return [];
+  const parts = t.match(/[^.!?…]+[.!?…]+["')\\]]*|\\S[^.!?…]*$/g);
+  return parts ? parts.map((s) => s.trim()).filter(Boolean) : [t];
+}
 
-    // fenced code block
-    if (/^\`\`\`/.test(line)) {
-      closeList();
-      i++;
-      let code = '';
-      while (i < lines.length && !/^\`\`\`/.test(lines[i])) { code += lines[i] + '\\n'; i++; }
-      i++; // skip closing fence
-      out += '<pre><code>' + esc(code.replace(/\\n$/, '')) + '</code></pre>';
-      continue;
-    }
-
-    const fmt = (s) => linkify(inline(s));
-
-    let m;
-    if ((m = line.match(/^(#{1,6})\\s+(.*)$/))) {
-      closeList();
-      const lvl = m[1].length;
-      out += '<h' + lvl + '>' + fmt(m[2]) + '</h' + lvl + '>';
-    } else if (/^\\s*[-*+]\\s+/.test(line)) {
-      if (listType !== 'ul') { closeList(); out += '<ul>'; listType = 'ul'; }
-      out += '<li>' + fmt(line.replace(/^\\s*[-*+]\\s+/, '')) + '</li>';
-    } else if (/^\\s*\\d+\\.\\s+/.test(line)) {
-      if (listType !== 'ol') { closeList(); out += '<ol>'; listType = 'ol'; }
-      out += '<li>' + fmt(line.replace(/^\\s*\\d+\\.\\s+/, '')) + '</li>';
-    } else if (/^\\s*>\\s?/.test(line)) {
-      closeList();
-      out += '<blockquote>' + fmt(line.replace(/^\\s*>\\s?/, '')) + '</blockquote>';
-    } else if (line.trim() === '') {
-      closeList();
-    } else {
-      closeList();
-      // gather consecutive non-blank lines into one paragraph (soft breaks)
-      let para = line;
-      while (i + 1 < lines.length && lines[i + 1].trim() !== '' &&
-             !/^(#{1,6}\\s|\\s*[-*+]\\s|\\s*\\d+\\.\\s|\\s*>|\`\`\`)/.test(lines[i + 1])) {
-        i++; para += '<br>' + lines[i];
-      }
-      out += '<p>' + fmt(para) + '</p>';
-    }
-    i++;
+function renderSegments(jobId, chunks) {
+  if (!chunks.length) {
+    $('previewBody').innerHTML = '<p style="color:var(--muted)">No segments.</p>';
+    return;
   }
-  closeList();
-  return out || '<p style="color:var(--muted)">Empty result.</p>';
+  $('previewBody').innerHTML = chunks.map((c) => {
+    const start = Number(c.start_sec) || 0;
+    const end = start + (Number(c.dur_sec) || 0);
+    const phrases = splitPhrases(c.transcript);
+    const spans = phrases.length
+      ? phrases.map((p) => '<span class="ph" data-w="' + p.split(/\\s+/).length + '">' + escapeHtml(p) + '</span>').join(' ')
+      : '<span style="color:var(--muted)">(no speech detected)</span>';
+    return '<div class="seg">' +
+        '<div class="seg-head">' +
+          '<span class="seg-title">Segment ' + (c.idx + 1) +
+            ' <span style="color:var(--muted);font-weight:400">(' + fmtClock(start) + '–' + fmtClock(end) + ')</span></span>' +
+          '<audio class="seg-audio" controls preload="none" src="/api/transcribe/jobs/' + jobId + '/chunks/' + c.idx + '/audio"></audio>' +
+        '</div>' +
+        '<p class="seg-text">' + spans + '</p>' +
+      '</div>';
+  }).join('');
+  wireSegmentHighlighting();
+}
+
+function wireSegmentHighlighting() {
+  const audios = [...$('previewBody').querySelectorAll('.seg-audio')];
+  audios.forEach((audio) => {
+    const seg = audio.closest('.seg');
+    const spans = [...seg.querySelectorAll('.ph')];
+    if (!spans.length) return;
+    // Cumulative end-fraction per phrase, weighted by word count.
+    const weights = spans.map((s) => Math.max(1, Number(s.dataset.w) || 1));
+    const total = weights.reduce((a, b) => a + b, 0);
+    const bounds = [];
+    let acc = 0;
+    for (const w of weights) { acc += w; bounds.push(acc / total); }
+
+    const clear = () => spans.forEach((s) => s.classList.remove('active'));
+    audio.addEventListener('timeupdate', () => {
+      const dur = isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+      if (!dur) return;
+      const prog = Math.min(0.999, audio.currentTime / dur);
+      let i = bounds.findIndex((b) => prog < b);
+      if (i === -1) i = spans.length - 1;
+      spans.forEach((s, j) => s.classList.toggle('active', j === i));
+    });
+    audio.addEventListener('ended', clear);
+    // Only one segment plays at a time.
+    audio.addEventListener('play', () => audios.forEach((a) => { if (a !== audio) a.pause(); }));
+  });
 }
 
 /* ---------- saved settings (DB) ---------- */

@@ -119,7 +119,7 @@ async function jobDetail(res, id) {
   const job = await db.query(`SELECT * FROM transcribe_jobs WHERE id = $1`, [id]);
   if (!job.rows[0]) return sendJson(res, 404, { error: "Job not found" });
   const chunks = await db.query(
-    `SELECT idx, status, start_sec, dur_sec, error FROM transcribe_chunks WHERE job_id = $1 ORDER BY idx`,
+    `SELECT idx, status, start_sec, dur_sec, transcript, error FROM transcribe_chunks WHERE job_id = $1 ORDER BY idx`,
     [id]
   );
   sendJson(res, 200, { job: job.rows[0], chunks: chunks.rows });
@@ -159,6 +159,30 @@ async function deleteJob(res, id) {
   await storage.deletePrefix(`jobs/${id}/`);
   await db.query(`DELETE FROM transcribe_jobs WHERE id = $1`, [id]);
   sendJson(res, 200, { deleted: true });
+}
+
+// Content type for a chunk's audio, keyed off its stored object extension.
+const CHUNK_CONTENT_TYPE = {
+  mp3: "audio/mpeg", m4a: "audio/mp4", mp4: "audio/mp4", aac: "audio/aac",
+  wav: "audio/wav", ogg: "audio/ogg", oga: "audio/ogg", opus: "audio/ogg",
+  flac: "audio/flac", webm: "audio/webm",
+};
+
+// Stream a single chunk's audio (used by the preview modal's per-segment player).
+async function streamChunkAudio(res, id, idx) {
+  const { rows } = await db.query(
+    `SELECT object_key FROM transcribe_chunks WHERE job_id = $1 AND idx = $2`,
+    [id, idx]
+  );
+  const key = rows[0]?.object_key;
+  if (!key) return sendJson(res, 404, { error: "Chunk not found" });
+  const ext = (key.split(".").pop() || "").toLowerCase();
+  res.writeHead(200, {
+    "content-type": CHUNK_CONTENT_TYPE[ext] || "application/octet-stream",
+    "cache-control": "private, max-age=300",
+  });
+  const stream = await storage.getStream(key);
+  stream.pipe(res);
 }
 
 async function streamResult(res, id, inline) {
@@ -204,6 +228,10 @@ async function handle(req, res, url) {
       await listJobs(res);
       return true;
     }
+
+    const cm = p.match(/^\/api\/transcribe\/jobs\/([0-9a-f-]+)\/chunks\/(\d+)\/audio$/i);
+    if (cm && req.method === "GET")
+      return (await streamChunkAudio(res, cm[1], Number(cm[2]))), true;
 
     const m = p.match(/^\/api\/transcribe\/jobs\/([0-9a-f-]+)(\/result|\/resume|\/stop)?$/i);
     if (m) {
